@@ -1,0 +1,138 @@
+# Full stack. Docker Compose is deliberately the whole deployment story: no
+# Kubernetes, no message broker, no cache (plan.md 4).
+#
+#   docker compose -f deployments/docker-compose.yml --env-file .env up -d
+name: tiny-wonders-invoice
+
+services:
+  # Caddy is the only web server in the stack: it routes /api to the Go binary
+  # and serves the SPA bundle baked into the image. One server means headers and
+  # caching rules are stated in exactly one place.
+  proxy:
+    build:
+      context: ..
+      dockerfile: deployments/proxy.Dockerfile
+    restart: unless-stopped
+    ports:
+      # Loopback only. This deployment is one private machine with no internet
+      # exposure (SECURITY-REVIEW.md); publishing on 0.0.0.0 would put the whole
+      # system on whatever network the laptop happens to join. The host port is
+      # non-standard so it cannot collide with another project in development.
+      #
+      # HTTPS only. Port 80 is deliberately not published: with nothing serving
+      # plain HTTP there is no downgrade to land on, and Strict-Transport-
+      # Security would refuse it in any case.
+      - "127.0.0.1:${HTTPS_PORT:-9843}:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    environment:
+      # Set to your real hostname in production so Caddy provisions HTTPS.
+      SITE_ADDRESS: ${SITE_ADDRESS:-:80}
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: ..
+      dockerfile: deployments/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      # Hardcoded, not read from .env, and the two belong together: config.go
+      # refuses APP_ENV=production while SECURE_COOKIES is false, so that no
+      # real site ever ships with a session cookie missing the Secure flag.
+      # Caddy terminates TLS in front, which is what earns both values.
+      #
+      # Not inherited from .env on purpose. That file configures a local
+      # `go run` against the throwaway development database, which is served
+      # over plain HTTP; letting its values reach this stack is how a
+      # development setting quietly becomes the live one.
+      APP_ENV: production
+      SECURE_COOKIES: "true"
+      HTTP_ADDR: ":8080"
+      DATABASE_URL: postgres://invoice:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/invoice?sslmode=disable
+      # Empty on purpose, and not inherited from .env: behind the proxy the SPA
+      # is same-origin with the API, so no cross-origin caller should ever be
+      # allowed to send credentialed requests at the real financial data. The
+      # value in .env exists for the Vite dev server, which talks to the
+      # separate development API on :8090, not to this stack.
+      CORS_ORIGINS: ""
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-12}
+      SESSION_IDLE_TIMEOUT_MINUTES: ${SESSION_IDLE_TIMEOUT_MINUTES:-60}
+      TIMEZONE: ${TIMEZONE:-Asia/Jerusalem}
+      STORAGE_DIR: /var/lib/invoice/storage
+      GOTENBERG_URL: http://gotenberg:3000
+      # Backups (plan.md 18). The container path is fixed; what varies is the
+      # host folder it is bind-mounted from, so the operator's sync tool sees
+      # the archives. Without these the scheduler starts, finds no directory,
+      # and says so — which is not the same as backing up.
+      # PG_DUMP_PATH is deliberately unset: this image ships postgresql16-client
+      # to match the postgres:16 server, so the pg_dump on PATH is the right one.
+      BACKUP_DIR: /var/lib/invoice/backups
+      BACKUP_AT: ${BACKUP_AT:-02:00}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      BOOTSTRAP_OWNER_EMAIL: ${BOOTSTRAP_OWNER_EMAIL:-}
+      BOOTSTRAP_OWNER_PASSWORD: ${BOOTSTRAP_OWNER_PASSWORD:-}
+      BOOTSTRAP_OWNER_NAME: ${BOOTSTRAP_OWNER_NAME:-}
+    volumes:
+      # Issued PDFs and attachments. Backed up separately from the database
+      # (plan.md 18).
+      - storage:/var/lib/invoice/storage
+      # A bind mount, not a named volume, on purpose: the archives have to be
+      # visible on the host for the operator's own cloud sync to pick them up.
+      # STACK_BACKUP_DIR, not BACKUP_DIR: the latter belongs to a local `go run`
+      # against the development database. Two databases writing archives into
+      # one folder under the same naming scheme is how a restore ends up
+      # applying the wrong dump.
+      - ${STACK_BACKUP_DIR:?STACK_BACKUP_DIR is required}:/var/lib/invoice/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+      gotenberg:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "/app/api", "-migrate-status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: invoice
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: invoice
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoice -d invoice"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # PDF rendering. Required: without it no document can be issued, which is
+  # deliberate — an issued document must always have its artifact (plan.md 3.4).
+  # Not published to the host: only the API talks to it.
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    restart: unless-stopped
+    command:
+      - "gotenberg"
+      # Templates are static HTML with inline CSS; no script needs to run, so
+      # disabling JavaScript removes a whole class of rendering surprises.
+      # Gotenberg's default deny list already confines file access to its own
+      # temporary directory; overriding it with ".*" would also block the
+      # template Chromium is asked to render.
+      - "--chromium-disable-javascript=true"
+      - "--api-timeout=60s"
+
+volumes:
+  postgres-data:
+  storage:
+  caddy-data:
+  caddy-config:

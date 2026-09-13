@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>{{ .DocumentTitle }} {{ .FullNumber }}</title>
+<style>
+  /* Self-contained by design: the renderer has no network access, so every
+     style lives here and no font or image is fetched. */
+  @page { size: A4; margin: 0; }
+
+  :root {
+    --ink: #1a1a1a;
+    --muted: #666;
+    --rule: #d8d8d8;
+    --accent: #0f766e;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: "Noto Sans Hebrew", "Arial Hebrew", "Segoe UI", Arial, sans-serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    color: var(--ink);
+    direction: rtl;
+  }
+
+  .page { position: relative; padding: 0; }
+
+  /* Test-mode documents must be unmistakable on paper and on screen: they are
+     not legal documents (plan.md 2). */
+  .watermark {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transform: rotate(-30deg);
+    font-size: 54pt;
+    font-weight: 700;
+    color: rgba(200, 30, 30, 0.13);
+    letter-spacing: 4pt;
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  .test-banner {
+    border: 1.5pt solid #c81e1e;
+    background: #fdf2f2;
+    color: #a11616;
+    padding: 6pt 10pt;
+    border-radius: 4pt;
+    font-weight: 600;
+    margin-bottom: 14pt;
+    text-align: center;
+  }
+
+  header { display: flex; justify-content: space-between; gap: 18pt; align-items: flex-start; }
+
+  /* The logo sits above the business name. Height is capped rather than width
+     so tall and wide marks both occupy a predictable band, and the aspect ratio
+     is never distorted. */
+  .logo {
+    max-height: 64pt;
+    max-width: 200pt;
+    width: auto;
+    height: auto;
+    margin-bottom: 6pt;
+    display: block;
+  }
+  .business-name { font-size: 16pt; font-weight: 700; margin: 0 0 2pt; }
+  .business-meta { color: var(--muted); font-size: 9.5pt; white-space: pre-line; }
+  .exempt-mark { margin-top: 4pt; font-weight: 600; color: var(--ink); font-size: 10pt; }
+
+  .doc-box { text-align: left; min-width: 170pt; }
+  .doc-title { font-size: 15pt; font-weight: 700; color: var(--accent); margin: 0 0 4pt; }
+  .doc-number { font-size: 13pt; font-weight: 700; direction: ltr; unicode-bidi: isolate; }
+  .doc-dates { color: var(--muted); font-size: 9.5pt; margin-top: 4pt; }
+
+  hr.rule { border: 0; border-top: 1pt solid var(--rule); margin: 14pt 0; }
+
+  .parties { display: flex; gap: 24pt; }
+  .party { flex: 1; }
+  .party h2 { font-size: 10pt; color: var(--muted); text-transform: none; margin: 0 0 3pt; font-weight: 600; }
+  .party .name { font-weight: 700; }
+  .party .detail { font-size: 10pt; color: var(--muted); white-space: pre-line; }
+
+  table.lines { width: 100%; border-collapse: collapse; margin-top: 14pt; }
+  table.lines th {
+    text-align: right;
+    font-size: 9.5pt;
+    color: var(--muted);
+    font-weight: 600;
+    border-bottom: 1pt solid var(--rule);
+    padding: 5pt 4pt;
+  }
+  table.lines td { padding: 6pt 4pt; border-bottom: 0.5pt solid #eee; vertical-align: top; }
+  table.lines tr { break-inside: avoid; }
+
+  /* Numbers read left-to-right even inside an RTL document. */
+  .num {
+    direction: ltr;
+    unicode-bidi: isolate;
+    text-align: left;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  th.num { text-align: left; }
+
+  .totals { margin-top: 12pt; display: flex; justify-content: flex-start; }
+  .totals table { border-collapse: collapse; min-width: 210pt; }
+  .totals td { padding: 4pt 6pt; }
+  .totals .label { color: var(--muted); }
+  .totals .grand td { border-top: 1.2pt solid var(--ink); font-weight: 700; font-size: 12.5pt; padding-top: 7pt; }
+
+  .payment-box {
+    margin-top: 16pt;
+    padding: 9pt 11pt;
+    background: #f6faf9;
+    border: 0.8pt solid #cfe3e0;
+    border-radius: 4pt;
+  }
+  .payment-box h2 { font-size: 10pt; color: var(--muted); margin: 0 0 5pt; font-weight: 600; }
+  .payment-table { border-collapse: collapse; }
+  .payment-table td { padding: 2pt 10pt 2pt 0; font-size: 10.5pt; }
+  .payment-table .label { color: var(--muted); }
+  .settled { margin-top: 6pt; font-size: 10pt; }
+  .settled .label { color: var(--muted); }
+  .settled-item { display: inline-block; margin-left: 10pt; }
+
+  .notes { margin-top: 16pt; font-size: 10pt; white-space: pre-line; }
+  .notes h2 { font-size: 10pt; color: var(--muted); margin: 0 0 3pt; font-weight: 600; }
+
+  footer {
+    margin-top: 22pt;
+    padding-top: 8pt;
+    border-top: 1pt solid var(--rule);
+    color: var(--muted);
+    font-size: 9pt;
+    white-space: pre-line;
+  }
+  .footer-meta { margin-top: 6pt; font-size: 8pt; color: #999; }
+</style>
+</head>
+<body>
+{{ if .TestMode }}<div class="watermark">מסמך לבדיקה בלבד</div>{{ end }}
+
+<div class="page">
+  {{ if .TestMode }}
+  <div class="test-banner">
+    מסמך לבדיקה בלבד — אינו מסמך רשמי ואין לו תוקף חשבונאי או משפטי.
+  </div>
+  {{ end }}
+
+  <header>
+    <div class="business-block">
+      {{ if .Business.LogoDataURI }}<img class="logo" src="{{ .Business.LogoDataURI }}" alt="">{{ end }}
+      <h1 class="business-name">{{ .Business.DisplayName }}</h1>
+      <div class="business-meta">{{ .Business.ContactBlock }}</div>
+      {{ if .RequiredWording }}<div class="exempt-mark">{{ .RequiredWording }}</div>{{ end }}
+    </div>
+
+    <div class="doc-box">
+      <div class="doc-title">{{ .DocumentTitle }}</div>
+      <div class="doc-number">{{ .FullNumber }}</div>
+      <div class="doc-dates">
+        תאריך: <span class="num">{{ .DocumentDate }}</span>
+        {{ if .DueDate }}<br>לתשלום עד: <span class="num">{{ .DueDate }}</span>{{ end }}
+      </div>
+      {{ if .Cancelled }}<div class="doc-dates" style="color:#a11616;font-weight:600">מסמך מבוטל</div>{{ end }}
+    </div>
+  </header>
+
+  <hr class="rule">
+
+  <div class="parties">
+    <div class="party">
+      <h2>לכבוד</h2>
+      <div class="name">{{ .Customer.DisplayName }}</div>
+      <div class="detail">{{ .Customer.DetailBlock }}</div>
+    </div>
+    {{ if .ActivityName }}
+    <div class="party">
+      <h2>פעילות</h2>
+      <div class="name">{{ .ActivityName }}</div>
+    </div>
+    {{ end }}
+  </div>
+
+  <table class="lines">
+    <thead>
+      <tr>
+        <th style="width:46%">תיאור</th>
+        <th style="width:14%">יחידה</th>
+        <th class="num" style="width:12%">כמות</th>
+        <th class="num" style="width:14%">מחיר ליחידה</th>
+        <th class="num" style="width:14%">סה״כ</th>
+      </tr>
+    </thead>
+    <tbody>
+      {{ range .Lines }}
+      <tr>
+        <td>{{ .Description }}</td>
+        <td>{{ .Unit }}</td>
+        <td class="num">{{ .Quantity }}</td>
+        <td class="num">{{ .UnitPrice }}</td>
+        <td class="num">{{ .LineTotal }}</td>
+      </tr>
+      {{ end }}
+    </tbody>
+  </table>
+
+  <div class="totals">
+    <table>
+      <tr>
+        <td class="label">סכום ביניים</td>
+        <td class="num">{{ .Subtotal }}</td>
+      </tr>
+      {{ if .ShowVAT }}
+      <tr>
+        <td class="label">מע״מ</td>
+        <td class="num">{{ .VAT }}</td>
+      </tr>
+      {{ end }}
+      <tr class="grand">
+        <td>סה״כ לתשלום</td>
+        <td class="num">{{ .Total }}</td>
+      </tr>
+    </table>
+  </div>
+
+  {{ if .Payment }}
+  <div class="payment-box">
+    <h2>פרטי התשלום שהתקבל</h2>
+    <table class="payment-table">
+      <tr>
+        <td class="label">סכום שהתקבל</td>
+        <td class="num">{{ .Payment.Amount }}</td>
+      </tr>
+      <tr>
+        <td class="label">אמצעי תשלום</td>
+        <td>{{ .Payment.MethodHebrew }}</td>
+      </tr>
+      <tr>
+        <td class="label">תאריך קבלה</td>
+        <td class="num">{{ .Payment.ReceivedAt }}</td>
+      </tr>
+      {{ if .Payment.Reference }}
+      <tr>
+        <td class="label">אסמכתא</td>
+        <td class="num">{{ .Payment.Reference }}</td>
+      </tr>
+      {{ end }}
+    </table>
+
+    {{ if .Payment.SettledDocuments }}
+    <div class="settled">
+      <span class="label">בגין:</span>
+      {{ range .Payment.SettledDocuments }}
+      <span class="settled-item">{{ .Title }} <span class="num">{{ .FullNumber }}</span> · <span class="num">{{ .Amount }}</span></span>
+      {{ end }}
+    </div>
+    {{ end }}
+
+    {{ if .Payment.OnAccount }}
+    <div class="settled">
+      <span class="label">על החשבון:</span>
+      <span class="settled-item num">{{ .Payment.OnAccount }}</span>
+    </div>
+    {{ end }}
+  </div>
+  {{ end }}
+
+  {{ if .PaymentDetails }}
+  <div class="notes">
+    <h2>פרטי תשלום</h2>
+    {{ .PaymentDetails }}
+  </div>
+  {{ end }}
+
+  {{ if .Notes }}
+  <div class="notes">
+    <h2>הערות</h2>
+    {{ .Notes }}
+  </div>
+  {{ end }}
+
+  <footer>
+    {{ .Business.FooterNote }}
+    <div class="footer-meta">
+      הופק ב־<span class="num">{{ .IssuedAt }}</span> · תבנית {{ .TemplateVersion }}
+    </div>
+  </footer>
+</div>
+</body>
+</html>

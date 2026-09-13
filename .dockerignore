@@ -1,0 +1,30 @@
+# Keeps the build context to source. Two reasons, and the second is not just
+# about speed: proxy.Dockerfile runs `npm ci` and then copies apps/web/ over the
+# result, so a host node_modules built for macOS would land on top of the Alpine
+# one and be used for the build.
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+apps/web/*.tsbuildinfo
+
+# Secrets must never reach an image layer.
+.env
+.env.local
+*.pem
+*.key
+
+# Local runtime data. Issued PDFs and archives belong in volumes and in the
+# backup folder, never baked into an image.
+/storage/
+/backups/
+/data/
+/bin/
+
+# Build and editor noise.
+*.test
+coverage.out
+.git/
+.DS_Store
+.idea/
+.vscode/
+graphify-out/

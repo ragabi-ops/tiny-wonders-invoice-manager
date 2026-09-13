@@ -1,0 +1,33 @@
+/* Base document styles. Mantine supplies component styling; this file holds
+   only what belongs to the page itself. */
+
+:root {
+  color-scheme: light;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  /* Hebrew numerals and dates read left-to-right inside an RTL page; the
+     browser handles that per bidi rules as long as the direction is declared. */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Long identifiers and emails must not force the page to scroll sideways. */
+.wrap-anywhere {
+  overflow-wrap: anywhere;
+}
+
+/* Tabular figures keep money columns aligned. */
+.numeric {
+  font-variant-numeric: tabular-nums;
+  direction: ltr;
+  unicode-bidi: isolate;
+  text-align: start;
+}

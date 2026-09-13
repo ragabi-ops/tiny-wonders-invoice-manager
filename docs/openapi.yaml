@@ -1,0 +1,2825 @@
+openapi: 3.1.0
+
+info:
+  title: Invoice & Receipt System API
+  version: 0.1.0
+  description: |
+    Internal API for a small Israeli business operating as `עוסק פטור`.
+
+    Conventions that hold everywhere:
+
+    - Money is an **integer number of agorot** (1 ILS = 100 agorot). Never a
+      decimal, never a float.
+    - Timestamps are RFC 3339 in UTC. Business dates are `YYYY-MM-DD`, already
+      interpreted in `Asia/Jerusalem`.
+    - Authentication is a session cookie. Unsafe methods must also send the
+      `X-CSRF-Token` header, echoing the `csrf_token` cookie.
+    - Errors always use one envelope. `code` is a stable English identifier;
+      `message` is Hebrew and is shown to the user as-is.
+
+    Sending a document never affects the document: delivery runs in a
+    background job, after issuance has committed, so a failed send cannot roll
+    back an issued document (plan.md 14).
+
+    Critical commands accept an `Idempotency-Key` header. A replay returns the
+    original response with `Idempotent-Replay: true`, so a retry after a timeout
+    never issues a second document with a second official number.
+
+servers:
+  - url: /api/v1
+
+tags:
+  - name: auth
+    description: Login, logout, current session, password change
+  - name: users
+    description: User administration (OWNER only)
+  - name: settings
+    description: Business profile and regulatory configuration
+  - name: compliance
+    description: Read-only tax-status and compliance-gate report
+  - name: audit
+    description: Read-only append-only activity log
+  - name: customers
+    description: Customers, with duplicate warnings
+  - name: services
+    description: The reusable service catalogue
+  - name: activities
+    description: Events and projects that documents can be attributed to
+  - name: search
+    description: One query across customers, services and activities
+  - name: documents
+    description: Drafts, atomic issuance, cancellation, snapshots and PDFs
+  - name: payments
+    description: Money received, what it settles, and the receipts it produces
+  - name: expenses
+    description: What the business spends, with receipts attached
+  - name: delivery
+    description: Getting issued documents to customers, and the history of every attempt
+  - name: reports
+    description: Revenue, unpaid documents, turnover, and the home screen
+  - name: exports
+    description: The accountant hand-off archive
+  - name: backups
+    description: The daily archive of everything that cannot be recreated
+
+security:
+  - sessionCookie: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [auth]
+      summary: Start a session
+      description: |
+        Sets the `session` and `csrf_token` cookies. Every failure — wrong
+        password, unknown account, inactive account — returns the same
+        `INVALID_CREDENTIALS` error, so accounts cannot be enumerated.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string, format: password }
+      responses:
+        '200':
+          description: Session created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '401':
+          $ref: '#/components/responses/Error'
+        '422':
+          $ref: '#/components/responses/Error'
+        '429':
+          description: Rate limited, or the account is temporarily locked
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      summary: End the current session
+      responses:
+        '204': { description: Session ended }
+        '401': { $ref: '#/components/responses/Error' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /auth/me:
+    get:
+      tags: [auth]
+      summary: The authenticated user
+      responses:
+        '200':
+          description: Current user
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeResponse' }
+        '401': { $ref: '#/components/responses/Error' }
+
+  /auth/change-password:
+    post:
+      tags: [auth]
+      summary: Change your own password
+      description: |
+        On success every session of the user is destroyed, including the one
+        making the request, so the client must log in again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string, format: password }
+                new_password: { type: string, format: password, minLength: 12 }
+      responses:
+        '204': { description: Password changed; all sessions ended }
+        '401': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /users/:
+    get:
+      tags: [users]
+      summary: List users
+      responses:
+        '200':
+          description: Users
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  users:
+                    type: array
+                    items: { $ref: '#/components/schemas/User' }
+        '403': { $ref: '#/components/responses/Error' }
+    post:
+      tags: [users]
+      summary: Create a user
+      description: The new account must change its password at first login.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, display_name, password, roles]
+              properties:
+                email: { type: string, format: email }
+                display_name: { type: string }
+                password: { type: string, format: password, minLength: 12 }
+                roles:
+                  type: array
+                  minItems: 1
+                  items: { $ref: '#/components/schemas/Role' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '409':
+          description: The email is already registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /users/roles:
+    get:
+      tags: [users]
+      summary: The closed set of roles, with Hebrew labels
+      responses:
+        '200':
+          description: Roles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roles:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        role: { $ref: '#/components/schemas/Role' }
+                        hebrew: { type: string }
+
+  /users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [users]
+      summary: One user
+      responses:
+        '200':
+          description: User
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /users/{id}/roles:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    put:
+      tags: [users]
+      summary: Replace a user's roles
+      description: Removing the last active OWNER is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  minItems: 1
+                  items: { $ref: '#/components/schemas/Role' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /users/{id}/active:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    put:
+      tags: [users]
+      summary: Enable or disable an account
+      description: |
+        Disabling also ends every session that account holds. Disabling the last
+        active OWNER, or your own account, is refused.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '409': { $ref: '#/components/responses/Error' }
+
+  /users/{id}/reset-password:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [users]
+      summary: Set another user's password
+      description: The account must change it at next login; its sessions end.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_password]
+              properties:
+                new_password: { type: string, format: password, minLength: 12 }
+      responses:
+        '204': { description: Password reset }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /settings/business-profile:
+    get:
+      tags: [settings]
+      summary: The business's own details
+      responses:
+        '200':
+          description: Business profile
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BusinessProfile' }
+    put:
+      tags: [settings]
+      summary: Replace the business profile (OWNER only)
+      description: |
+        Does not affect documents already issued: each one carries its own
+        snapshot of these values.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/BusinessProfile' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BusinessProfile' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /settings/regulatory:
+    get:
+      tags: [settings]
+      summary: Effective-dated regulatory configuration (OWNER only)
+      parameters:
+        - name: key
+          in: query
+          schema: { type: string }
+          description: Restrict the history to one key
+      responses:
+        '200':
+          description: Configuration history, newest first
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/RegulatoryEntry' }
+    post:
+      tags: [settings]
+      summary: Add a new effective-dated value (OWNER only)
+      description: |
+        Existing rows are never edited or deleted — the database refuses both.
+        A change is expressed as a new row with a later `effective_from`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [key, effective_from, value]
+              properties:
+                key: { type: string }
+                effective_from: { type: string, format: date }
+                value: { description: Any JSON value }
+                note: { type: string }
+      responses:
+        '201': { description: Stored }
+        '409': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /compliance/:
+    get:
+      tags: [compliance]
+      summary: Tax status and compliance-gate state
+      description: |
+        `real_issuance_enabled` is false until a tax adviser resolves every gate
+        item. While it is false the system is in test mode.
+      responses:
+        '200':
+          description: Compliance status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ComplianceStatus' }
+
+  /audit/:
+    get:
+      tags: [audit]
+      summary: The activity log, newest first
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: before
+          in: query
+          schema: { type: string, format: date-time }
+          description: Keyset cursor — return events older than this timestamp
+        - name: operation
+          in: query
+          schema: { type: string }
+        - name: entity_type
+          in: query
+          schema: { type: string }
+        - name: entity_id
+          in: query
+          schema: { type: string }
+        - name: actor_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: '#/components/schemas/AuditEvent' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /customers/:
+    get:
+      tags: [customers]
+      summary: List customers
+      description: |
+        Substring search over name, legal name, business number, phone (as typed
+        and as bare digits) and email. Archived customers are excluded unless
+        `include_archived` is true.
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+        - $ref: '#/components/parameters/IncludeArchived'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: A page of customers
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerPage' }
+    post:
+      tags: [customers]
+      summary: Create a customer
+      description: |
+        When the input resembles an existing customer the request is refused
+        with `409` and the candidates attached, unless `confirm_duplicate` is
+        true. Duplicates are warned about, never blocked outright: two people
+        can legitimately share a phone number (plan.md 8).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CustomerInput'
+                - type: object
+                  properties:
+                    confirm_duplicate:
+                      type: boolean
+                      default: false
+                      description: Proceed even though duplicates were found
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409':
+          description: Possible duplicates found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DuplicateConflict' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /customers/check-duplicates:
+    post:
+      tags: [customers]
+      summary: Look for customers resembling this input, without writing
+      description: The UI calls this while the operator types.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - $ref: '#/components/schemas/CustomerInput'
+                - type: object
+                  properties:
+                    exclude_id:
+                      type: string
+                      format: uuid
+                      description: The customer being edited, so it never matches itself
+      responses:
+        '200':
+          description: Candidates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  duplicates:
+                    type: array
+                    items: { $ref: '#/components/schemas/CustomerDuplicate' }
+
+  /customers/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [customers]
+      summary: One customer
+      responses:
+        '200':
+          description: Customer
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [customers]
+      summary: Replace a customer's details
+      description: |
+        Does not affect documents already issued: each one carries its own
+        snapshot of the customer (plan.md 11).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CustomerInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+        '404': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /customers/{id}/active:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    put:
+      tags: [customers]
+      summary: Archive or restore a customer
+      description: |
+        There is no delete. Documents reference customers and must stay readable
+        for as long as the law requires them kept.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+                reason: { type: string }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Customer' }
+
+  /services/:
+    get:
+      tags: [services]
+      summary: List catalogue items
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+        - name: category
+          in: query
+          schema: { type: string }
+        - $ref: '#/components/parameters/IncludeArchived'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: A page of catalogue items
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServicePage' }
+    post:
+      tags: [services]
+      summary: Create a catalogue item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Service' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /services/categories:
+    get:
+      tags: [services]
+      summary: The categories already in use
+      responses:
+        '200':
+          description: Categories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categories:
+                    type: array
+                    items: { type: string }
+
+  /services/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [services]
+      summary: One catalogue item
+      responses:
+        '200':
+          description: Catalogue item
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Service' }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [services]
+      summary: Replace a catalogue item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ServiceInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Service' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /services/{id}/active:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    put:
+      tags: [services]
+      summary: Archive or restore a catalogue item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Service' }
+
+  /activities/:
+    get:
+      tags: [activities]
+      summary: List activities, most recent first
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/ActivityStatus' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: A page of activities
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActivityPage' }
+    post:
+      tags: [activities]
+      summary: Create an activity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivityInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Activity' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /activities/statuses:
+    get:
+      tags: [activities]
+      summary: The closed set of statuses, with Hebrew labels
+      responses:
+        '200':
+          description: Statuses
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  statuses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        status: { $ref: '#/components/schemas/ActivityStatus' }
+                        hebrew: { type: string }
+
+  /activities/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [activities]
+      summary: One activity
+      responses:
+        '200':
+          description: Activity
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Activity' }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [activities]
+      summary: Replace an activity
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActivityInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Activity' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /search/:
+    get:
+      tags: [search]
+      summary: One query across customers, services and activities
+      description: |
+        A navigation aid, capped at a few hits per kind and with no paging.
+        Queries shorter than two characters return nothing rather than
+        everything. Archived customers and services are excluded.
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string, minLength: 2 }
+      responses:
+        '200':
+          description: Results grouped by kind
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResults' }
+
+  /documents/:
+    get:
+      tags: [documents]
+      summary: List documents, newest first
+      parameters:
+        - name: q
+          in: query
+          schema: { type: string }
+          description: Matches the customer name or the full document number
+        - name: customer_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: activity_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: document_type
+          in: query
+          schema: { $ref: '#/components/schemas/DocumentType' }
+        - name: state
+          in: query
+          schema: { $ref: '#/components/schemas/DocumentState' }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: A page of documents
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentPage' }
+    post:
+      tags: [documents]
+      summary: Create a draft
+      description: |
+        Totals are **computed by the server** from the lines. The request body
+        has no place for them, and a body that carries one is rejected as an
+        unknown field (plan.md 3.2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentDraftInput' }
+      responses:
+        '201':
+          description: Draft created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '400':
+          description: The body carried an unknown field, such as a total
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '403': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /documents/types:
+    get:
+      tags: [documents]
+      summary: The document types this deployment may issue
+      description: |
+        Never includes `TAX_INVOICE`: an exempt dealer may not issue one
+        (plan.md 2).
+      responses:
+        '200':
+          description: Types
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  types:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        type: { $ref: '#/components/schemas/DocumentType' }
+                        hebrew: { type: string }
+
+  /documents/sequences:
+    get:
+      tags: [documents]
+      summary: The numbering report
+      description: |
+        One row per counter. A gap between `issued_count` and `next_number - 1`
+        means an issuance was rolled back, which is expected and harmless: a
+        document is never renumbered to fill it (plan.md 15).
+      responses:
+        '200':
+          description: Sequences
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sequences:
+                    type: array
+                    items: { $ref: '#/components/schemas/SequenceState' }
+
+  /documents/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [documents]
+      summary: One document, with its lines
+      responses:
+        '200':
+          description: Document
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [documents]
+      summary: Replace a draft's contents
+      description: |
+        Drafts only. An issued document is immutable, and both the API and a
+        database trigger refuse the change (plan.md 3.1).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentDraftInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '409':
+          description: The document is issued and cannot be edited
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [documents]
+      summary: Delete a draft
+      description: Only a draft can be deleted. There is no endpoint that deletes an issued document.
+      responses:
+        '204': { description: Draft deleted }
+        '409':
+          description: The document is issued and cannot be deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /documents/{id}/issue:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [documents]
+      summary: Issue a draft as an official document
+      description: |
+        One transaction does all of it (plan.md 9): validate the state, allocate
+        the official number, recompute the totals, snapshot the business,
+        customer and lines, stamp the server issue time, render the PDF, store
+        it with its SHA-256 and template version, write the audit event, commit.
+
+        If any step fails — including PDF rendering — nothing commits and the
+        allocated number is returned by the rollback. A document is never issued
+        without its artifact.
+
+        While the compliance gate is unresolved the document is issued into the
+        separate `TEST` series, flagged `test_mode`, and watermarked. It can
+        never consume an official number (plan.md 2).
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: |
+            Issued. `Idempotent-Replay: true` on the response means this was a
+            replay of an earlier request under the same key.
+          headers:
+            Idempotent-Replay:
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '403':
+          description: The compliance adapter refused this document type
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '409':
+          description: Already issued, already cancelled, or the key was reused for a different request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500':
+          description: |
+            The PDF renderer is unavailable. Nothing was issued and no number
+            was consumed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /documents/{id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [documents]
+      summary: Cancel an issued document
+      description: |
+        Preserves the original number, totals, snapshot and PDF; only the
+        cancellation fields are added, and the database refuses any other change
+        (plan.md 9). A reason is required: an unexplained cancellation is not
+        auditable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reason]
+              properties:
+                reason: { type: string, minLength: 3 }
+      responses:
+        '200':
+          description: Cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '409':
+          description: The document is a draft, or is already cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /documents/{id}/snapshot:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [documents]
+      summary: The immutable snapshot taken at issuance
+      description: |
+        Exactly what the document said when it was issued. Editing the customer
+        afterwards does not change it: a historical document is never
+        reconstructed from the mutable tables (plan.md 11).
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DocumentSnapshot' }
+        '404':
+          description: The document is still a draft and has no snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /documents/{id}/pdf:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [documents]
+      summary: Download the stored PDF
+      description: |
+        Streams the artifact stored at issuance, after verifying it against the
+        SHA-256 recorded on the document. A file that no longer matches its hash
+        is refused rather than served (plan.md 14).
+      responses:
+        '200':
+          description: The stored PDF
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '409':
+          description: The document is a draft and has no PDF
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '500':
+          description: The stored file is missing or does not match its hash
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /payments/:
+    get:
+      tags: [payments]
+      summary: List payments, newest first
+      parameters:
+        - name: customer_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: activity_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: method
+          in: query
+          schema: { $ref: '#/components/schemas/PaymentMethod' }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - name: unreceipted
+          in: query
+          schema: { type: boolean, default: false }
+          description: Only payments that have no receipt yet
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: A page of payments
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PaymentPage' }
+    post:
+      tags: [payments]
+      summary: Record a payment and issue its receipt
+      description: |
+        The primary flow of plan.md 12, in one transaction: validate, persist the
+        payment, record what it settles, allocate the receipt number atomically,
+        create the immutable receipt, render and store its PDF, audit, commit.
+        The payment and its receipt can never disagree, because they commit
+        together or not at all.
+
+        Set `issue_receipt: false` to record the payment alone. That exists for
+        the case where money arrives while the PDF renderer is down: losing the
+        record would be worse than lacking the receipt. The receipt is issued
+        afterwards with `POST /payments/{id}/receipt`.
+
+        Allocations are refused if they exceed the payment, exceed what a
+        document still owes, name a document belonging to another customer, or
+        name a document that is not issued.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentInput' }
+      responses:
+        '201':
+          description: |
+            Recorded. `Idempotent-Replay: true` means this was a replay of an
+            earlier request under the same key.
+          headers:
+            Idempotent-Replay:
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '403': { $ref: '#/components/responses/Error' }
+        '409':
+          description: The idempotency key was used with a different request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422': { $ref: '#/components/responses/Error' }
+        '500':
+          description: |
+            The PDF renderer is unavailable, so no receipt could be issued and
+            nothing was recorded. Retry with `issue_receipt: false`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /payments/methods:
+    get:
+      tags: [payments]
+      summary: The closed set of payment methods, with Hebrew labels
+      responses:
+        '200':
+          description: Methods
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  methods:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        method: { $ref: '#/components/schemas/PaymentMethod' }
+                        hebrew: { type: string }
+
+  /payments/by-method:
+    get:
+      tags: [payments]
+      summary: Payments summarized by method (plan.md 15)
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Totals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  totals:
+                    type: array
+                    items: { $ref: '#/components/schemas/MethodTotal' }
+
+  /payments/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [payments]
+      summary: One payment, with its allocations
+      responses:
+        '200':
+          description: Payment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /payments/{id}/receipt:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [payments]
+      summary: Issue the receipt for a payment that has none
+      description: |
+        For a payment recorded with `issue_receipt: false`. A payment has at most
+        one receipt; issuing a second is refused. Once the receipt exists the
+        payment row is frozen — a database trigger refuses any further change,
+        because the receipt states its amount, method and date.
+      responses:
+        '200':
+          description: The payment, now with its receipt attached
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '409':
+          description: The payment already has a receipt
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /customers/{id}/balance:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [customers]
+      summary: What the customer owes and has paid (plan.md 8)
+      responses:
+        '200':
+          description: Balance
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CustomerBalance' }
+
+  /customers/{id}/timeline:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [customers]
+      summary: The customer's documents and payments, newest first
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: Timeline
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  entries:
+                    type: array
+                    items: { $ref: '#/components/schemas/TimelineEntry' }
+
+  /customers/{id}/outstanding:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [customers]
+      summary: Issued documents this customer still owes money on
+      description: |
+        Invoices and payment requests that are issued, uncancelled and not fully
+        settled. Receipts are excluded: a receipt acknowledges money already
+        received and is never something a customer owes.
+      responses:
+        '200':
+          description: Outstanding documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documents:
+                    type: array
+                    items: { $ref: '#/components/schemas/OutstandingDocument' }
+
+  /expenses/:
+    get:
+      tags: [expenses]
+      summary: List expenses, newest first
+      parameters:
+        - $ref: '#/components/parameters/SearchQuery'
+        - name: category
+          in: query
+          schema: { type: string }
+        - name: activity_id
+          in: query
+          schema: { type: string, format: uuid }
+        - name: payment_method
+          in: query
+          schema: { $ref: '#/components/schemas/PaymentMethod' }
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          description: A page of expenses
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExpensePage' }
+    post:
+      tags: [expenses]
+      summary: Record an expense
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExpenseInput' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Expense' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /expenses/categories:
+    get:
+      tags: [expenses]
+      summary: The expense categories already in use
+      responses:
+        '200':
+          description: Categories
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  categories:
+                    type: array
+                    items: { type: string }
+
+  /expenses/by-category:
+    get:
+      tags: [expenses]
+      summary: Expenses summarized by category (plan.md 15)
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+        - name: activity_id
+          in: query
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Totals
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  totals:
+                    type: array
+                    items: { $ref: '#/components/schemas/CategoryTotal' }
+
+  /expenses/{id}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [expenses]
+      summary: One expense, with its attachments
+      responses:
+        '200':
+          description: Expense
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Expense' }
+        '404': { $ref: '#/components/responses/Error' }
+    put:
+      tags: [expenses]
+      summary: Replace an expense
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExpenseInput' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Expense' }
+        '422': { $ref: '#/components/responses/Error' }
+    delete:
+      tags: [expenses]
+      summary: Delete an expense
+      description: |
+        Unlike an issued document, an expense is an internal record with no
+        official number, so a mistake is corrected by deleting it. The deletion
+        is audited, and the stored attachment files are retained.
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /expenses/{id}/attachments:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [expenses]
+      summary: Attach a receipt photo or supplier PDF
+      description: |
+        The type is decided by sniffing the uploaded bytes, never by the
+        filename or the declared content type, so a script named `receipt.pdf`
+        is refused. Accepted: JPEG, PNG, HEIC, WEBP, PDF. Maximum 20 MiB.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExpenseAttachment' }
+        '413':
+          description: The file is too large
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422':
+          description: The bytes are not an accepted file type
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /expenses/{id}/attachments/{attachmentID}:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+      - name: attachmentID
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    delete:
+      tags: [expenses]
+      summary: Remove an attachment from an expense
+      description: |
+        Removes the record. The stored file itself is retained: storage is
+        cheap, and an accidentally deleted receipt photo is not recoverable.
+      responses:
+        '204': { description: Removed }
+
+  /expenses/attachments/{attachmentID}:
+    parameters:
+      - name: attachmentID
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [expenses]
+      summary: Download an attachment
+      description: |
+        Verified against its recorded SHA-256 and always served as an
+        attachment with `nosniff`, so an uploaded file can never execute in
+        this origin.
+      responses:
+        '200':
+          description: The stored file
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /documents/{id}/send:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [delivery]
+      summary: Queue the document for email
+      description: |
+        Returns as soon as the job is queued. The document is already issued and
+        committed, so nothing about delivery can undo it — that is the guarantee
+        plan.md 14 requires. Temporary failures are retried with backoff, and
+        every attempt is recorded.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                recipient:
+                  type: string
+                  description: Overrides the customer's stored email for this send
+      responses:
+        '202':
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeliveryAttempt' }
+        '409':
+          description: The document is a draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422': { $ref: '#/components/responses/Error' }
+        '500':
+          description: Email is not configured in this deployment
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /documents/{id}/whatsapp:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    post:
+      tags: [delivery]
+      summary: Prepare a WhatsApp share link
+      description: |
+        v1 is user-initiated: the server prepares a Hebrew message and a wa.me
+        link, and the operator sends it from their own WhatsApp. The Business
+        API is a later step (plan.md 14). The preparation is recorded in the
+        delivery history.
+      responses:
+        '200':
+          description: The prepared share
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WhatsAppShare' }
+        '409':
+          description: The document is a draft
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422':
+          description: The customer has no phone number
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /documents/{id}/deliveries:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [delivery]
+      summary: A document's delivery history, newest first
+      responses:
+        '200':
+          description: Attempts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attempts:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryAttempt' }
+
+  /delivery/status:
+    get:
+      tags: [delivery]
+      summary: Which delivery channels this deployment can use
+      description: |
+        `email_available` is false when SMTP is not configured, so the UI can
+        hide a send that cannot work rather than offering it and failing.
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email_available: { type: boolean }
+                  whatsapp_available: { type: boolean }
+
+  /delivery/failures:
+    get:
+      tags: [delivery]
+      summary: Recent failed deliveries
+      responses:
+        '200':
+          description: Failures
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attempts:
+                    type: array
+                    items: { $ref: '#/components/schemas/DeliveryAttempt' }
+
+  /reports/dashboard:
+    get:
+      tags: [reports]
+      summary: Everything the home screen shows, in one call
+      description: |
+        Revenue counts issued, uncancelled invoices and payment requests.
+        Receipts are excluded: a receipt acknowledges money the document it
+        settles already accounts for, so counting both would double every
+        figure.
+      responses:
+        '200':
+          description: Dashboard
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+
+  /reports/revenue:
+    get:
+      tags: [reports]
+      summary: Revenue, broken down as asked
+      parameters:
+        - name: by
+          in: query
+          schema:
+            type: string
+            enum: [period, customer, service, activity]
+            default: period
+        - name: granularity
+          in: query
+          description: Only for `by=period`
+          schema:
+            type: string
+            enum: [day, month, year]
+            default: month
+        - name: from
+          in: query
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          schema: { type: string, format: date }
+      responses:
+        '200':
+          description: Rows
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows:
+                    type: array
+                    items: { $ref: '#/components/schemas/RevenueRow' }
+                  range:
+                    type: object
+                    properties:
+                      from: { type: string }
+                      to: { type: string }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /reports/unpaid:
+    get:
+      tags: [reports]
+      summary: Issued documents that still owe money, most overdue first
+      responses:
+        '200':
+          description: Documents
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  documents:
+                    type: array
+                    items: { $ref: '#/components/schemas/UnpaidRow' }
+
+  /reports/turnover:
+    get:
+      tags: [reports]
+      summary: Progress against the exempt-dealer annual ceiling
+      description: |
+        A year with no configured ceiling reports `threshold_known: false`
+        rather than a guessed number (plan.md 22.3).
+      parameters:
+        - name: year
+          in: query
+          schema: { type: integer, minimum: 2000, maximum: 2200 }
+      responses:
+        '200':
+          description: Turnover
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Turnover' }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /exports/:
+    post:
+      tags: [exports]
+      summary: Queue an accountant export
+      description: |
+        Builds one ZIP holding `documents.csv`, `payments.csv`, `expenses.csv`,
+        `customers.csv`, a `manifest.json`, the issued PDFs under `pdf/<type>/`
+        and the expense attachments (plan.md 15). CSVs are UTF-8 with a BOM so
+        Excel opens Hebrew correctly.
+
+        Building runs in the background; poll the status endpoint.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                from: { type: string, format: date }
+                to: { type: string, format: date }
+                include_pdfs: { type: boolean, default: true }
+                include_attachments: { type: boolean, default: true }
+      responses:
+        '202':
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string, format: uuid }
+                  state: { type: string }
+        '422': { $ref: '#/components/responses/Error' }
+
+  /exports/{jobID}:
+    parameters:
+      - name: jobID
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [exports]
+      summary: How a build is going
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExportStatus' }
+        '404': { $ref: '#/components/responses/Error' }
+
+  /exports/{jobID}/download:
+    parameters:
+      - name: jobID
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [exports]
+      summary: Download a finished archive
+      description: Verified against the SHA-256 recorded when it was built.
+      responses:
+        '200':
+          description: The archive
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        '409':
+          description: The build is not finished
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /backups/status:
+    get:
+      tags: [backups]
+      summary: Where backups stand (OWNER only)
+      description: |
+        `stale` is true when the newest successful backup is more than 36 hours
+        old, or when none has ever succeeded — a daily schedule has then missed
+        at least one run. `tools` reports whether `pg_dump` matches the server:
+        a mismatch produces archives that do not restore cleanly, which is worse
+        than a visibly failed backup.
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BackupStatus' }
+        '403': { $ref: '#/components/responses/Error' }
+
+  /backups/runs:
+    get:
+      tags: [backups]
+      summary: Recent backup runs, newest first (OWNER only)
+      responses:
+        '200':
+          description: Runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items: { $ref: '#/components/schemas/BackupRun' }
+
+  /backups/run:
+    post:
+      tags: [backups]
+      summary: Take a backup now (OWNER only)
+      description: |
+        Runs synchronously rather than queued: an operator asking for a backup is
+        usually about to do something risky and wants to know it worked first.
+        The same thing is available without a login as `api -backup-now`.
+      responses:
+        '200':
+          description: The completed run
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BackupRun' }
+        '403': { $ref: '#/components/responses/Error' }
+        '500':
+          description: No backup directory is configured, or pg_dump failed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /documents/{id}/preview:
+    parameters:
+      - $ref: '#/components/parameters/ResourceId'
+    get:
+      tags: [documents]
+      summary: See a draft as it will look once issued
+      description: |
+        Renders the draft with the current template, business profile and logo,
+        and returns it inline as a PDF. **Nothing is allocated or stored** — no
+        official number, no snapshot, no saved file — so the draft stays fully
+        editable afterwards.
+
+        The output carries a `טיוטה` watermark and an explanatory banner, so a
+        printed preview can never be mistaken for the document itself. Issuance
+        is irreversible; this is the last cheap moment to catch a mistake.
+
+        Readable by any role: looking changes nothing.
+      responses:
+        '200':
+          description: The preview, inline
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '409':
+          description: The document is already issued and has a real PDF
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '422':
+          description: The draft has no lines
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /payments/preview:
+    post:
+      tags: [payments]
+      summary: See the receipt a payment would produce, before recording it
+      description: |
+        A receipt is never a draft — it commits together with its payment — so
+        this is the only chance to look at one before it becomes immutable.
+
+        Takes the payment exactly as the operator has filled it in, validates it
+        the same way recording would, and renders the receipt that would be
+        issued. **Records nothing.** The preview and the real issuance build the
+        receipt through the same code, so what is approved is what gets issued.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentInput' }
+      responses:
+        '200':
+          description: The preview, inline
+          content:
+            application/pdf:
+              schema: { type: string, format: binary }
+        '422': { $ref: '#/components/responses/Error' }
+
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: session
+      description: |
+        Set by `POST /auth/login`. Unsafe methods must also send
+        `X-CSRF-Token`, echoing the `csrf_token` cookie.
+
+  parameters:
+    ResourceId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+    SearchQuery:
+      name: q
+      in: query
+      schema: { type: string }
+      description: Case-insensitive substring match
+
+    IncludeArchived:
+      name: include_archived
+      in: query
+      schema: { type: boolean, default: false }
+
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, minimum: 0, default: 0 }
+
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, maxLength: 200 }
+      description: |
+        Makes a retry safe. A repeat with the same key returns the original
+        response; the same key with a different request is refused with 409.
+
+    UserId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    Error:
+      description: Error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: Stable English machine identifier
+              examples: [UNAUTHORIZED, VALIDATION_FAILED, DOCUMENT_IMMUTABLE]
+            message:
+              type: string
+              description: Hebrew text, shown to the user as-is
+            details:
+              type: object
+              additionalProperties: true
+              description: Field-level messages, keyed by field name
+            request_id:
+              type: string
+
+    Role:
+      type: string
+      enum: [OWNER, OPERATOR, ACCOUNTANT, READ_ONLY]
+
+    User:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        email: { type: string, format: email }
+        display_name: { type: string }
+        active: { type: boolean }
+        must_change_password: { type: boolean }
+        roles:
+          type: array
+          items: { $ref: '#/components/schemas/Role' }
+        last_login_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+
+    MeResponse:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        roles:
+          type: array
+          items: { type: string }
+
+    BusinessProfile:
+      type: object
+      properties:
+        legal_name: { type: string }
+        display_name: { type: string }
+        business_number: { type: string }
+        address: { type: string }
+        phone: { type: string }
+        email: { type: string }
+        website: { type: string }
+        bank_details: { type: string }
+        footer_note: { type: string }
+        updated_at: { type: string, format: date-time, readOnly: true }
+
+    RegulatoryEntry:
+      type: object
+      properties:
+        key: { type: string }
+        effective_from: { type: string, format: date }
+        value: { description: Any JSON value }
+        note: { type: [string, 'null'] }
+        created_at: { type: string, format: date-time }
+
+    ComplianceStatus:
+      type: object
+      properties:
+        business_date: { type: string, format: date }
+        mode:
+          type: string
+          enum: [EXEMPT_DEALER, AUTHORIZED_DEALER]
+        mode_hebrew: { type: string }
+        vat_applies:
+          type: boolean
+          description: Always false for an exempt dealer
+        allowed_document_types:
+          type: array
+          items: { type: string }
+        real_issuance_enabled: { type: boolean }
+        unresolved_gate_items:
+          type: array
+          items: { type: string }
+        threshold_known: { type: boolean }
+        threshold_agorot:
+          type: integer
+          format: int64
+          description: Annual exempt-dealer turnover ceiling, in agorot
+
+    AuditEvent:
+      type: object
+      properties:
+        id: { type: integer, format: int64 }
+        occurred_at: { type: string, format: date-time }
+        actor_user_id: { type: [string, 'null'], format: uuid }
+        actor_email: { type: [string, 'null'] }
+        operation: { type: string }
+        entity_type: { type: [string, 'null'] }
+        entity_id: { type: [string, 'null'] }
+        request_id: { type: [string, 'null'] }
+        before_summary: { description: Any JSON value }
+        after_summary: { description: Any JSON value }
+        reason: { type: [string, 'null'] }
+        ip: { type: [string, 'null'] }
+
+    CustomerType:
+      type: string
+      enum: [PERSON, BUSINESS]
+
+    DeliveryPreference:
+      type: string
+      enum: [EMAIL, WHATSAPP, NONE]
+      description: |
+        How this customer prefers to receive documents. EMAIL requires an email
+        address and WHATSAPP a phone number.
+
+    CustomerInput:
+      type: object
+      required: [display_name]
+      properties:
+        customer_type:
+          allOf: [{ $ref: '#/components/schemas/CustomerType' }]
+          default: PERSON
+        display_name: { type: string, minLength: 1 }
+        legal_name: { type: string }
+        business_or_id_number:
+          type: string
+          description: Company number or national ID. Optional by design (plan.md 8).
+        phone: { type: string }
+        email: { type: string }
+        address: { type: string }
+        notes: { type: string }
+        preferred_delivery:
+          allOf: [{ $ref: '#/components/schemas/DeliveryPreference' }]
+          default: NONE
+
+    Customer:
+      allOf:
+        - $ref: '#/components/schemas/CustomerInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid, readOnly: true }
+            active: { type: boolean, readOnly: true }
+            created_at: { type: string, format: date-time, readOnly: true }
+            updated_at: { type: string, format: date-time, readOnly: true }
+
+    CustomerPage:
+      type: object
+      properties:
+        customers:
+          type: array
+          items: { $ref: '#/components/schemas/Customer' }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    CustomerDuplicate:
+      type: object
+      properties:
+        customer: { $ref: '#/components/schemas/Customer' }
+        reason:
+          type: string
+          enum: [PHONE, EMAIL, BUSINESS_NUMBER, NAME]
+        reason_hebrew: { type: string }
+
+    DuplicateConflict:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, examples: [CONFLICT] }
+            message: { type: string }
+            details:
+              type: object
+              properties:
+                code: { type: string, examples: [DUPLICATE_CUSTOMER] }
+                duplicates:
+                  type: array
+                  items: { $ref: '#/components/schemas/CustomerDuplicate' }
+
+    ServiceInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        description: { type: string }
+        default_price_agorot:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Default unit price in agorot. A document line may override it; the
+            server recalculates every total regardless.
+        unit: { type: string, examples: ["שעה", "יחידה"] }
+        category: { type: string }
+
+    Service:
+      allOf:
+        - $ref: '#/components/schemas/ServiceInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid, readOnly: true }
+            active: { type: boolean, readOnly: true }
+            created_at: { type: string, format: date-time, readOnly: true }
+            updated_at: { type: string, format: date-time, readOnly: true }
+
+    ServicePage:
+      type: object
+      properties:
+        services:
+          type: array
+          items: { $ref: '#/components/schemas/Service' }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    ActivityStatus:
+      type: string
+      enum: [PLANNED, ACTIVE, DONE, CANCELLED]
+
+    ActivityInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1 }
+        start_at: { type: [string, 'null'], format: date-time }
+        end_at:
+          type: [string, 'null']
+          format: date-time
+          description: Must not precede start_at; the database enforces this too.
+        location: { type: string }
+        status:
+          allOf: [{ $ref: '#/components/schemas/ActivityStatus' }]
+          default: PLANNED
+        notes: { type: string }
+
+    Activity:
+      allOf:
+        - $ref: '#/components/schemas/ActivityInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid, readOnly: true }
+            created_at: { type: string, format: date-time, readOnly: true }
+            updated_at: { type: string, format: date-time, readOnly: true }
+
+    ActivityPage:
+      type: object
+      properties:
+        activities:
+          type: array
+          items: { $ref: '#/components/schemas/Activity' }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    SearchHit:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [CUSTOMER, SERVICE, ACTIVITY]
+        id: { type: string, format: uuid }
+        title: { type: string }
+        subtitle: { type: string }
+
+    SearchResults:
+      type: object
+      properties:
+        query: { type: string }
+        customers:
+          type: array
+          items: { $ref: '#/components/schemas/SearchHit' }
+        services:
+          type: array
+          items: { $ref: '#/components/schemas/SearchHit' }
+        activities:
+          type: array
+          items: { $ref: '#/components/schemas/SearchHit' }
+
+    DocumentType:
+      type: string
+      enum: [TRANSACTION_INVOICE, PAYMENT_REQUEST, RECEIPT]
+      description: |
+        חשבונית עסקה, דרישת תשלום, קבלה. `TAX_INVOICE` (חשבונית מס) is absent by
+        design: an exempt dealer may not issue one.
+
+    DocumentState:
+      type: string
+      enum: [DRAFT, ISSUED, CANCELLED]
+
+    DocumentLineInput:
+      type: object
+      required: [description, quantity_milli, unit_price_agorot]
+      properties:
+        service_id:
+          type: [string, 'null']
+          format: uuid
+          description: The catalogue item this line came from, if any. Free-form lines carry none.
+        description: { type: string, minLength: 1 }
+        unit: { type: string }
+        quantity_milli:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Quantity in integer thousandths: 1.5 hours is 1500. Exact, like
+            money — no float touches a line.
+        unit_price_agorot:
+          type: integer
+          format: int64
+          minimum: 0
+
+    DocumentLine:
+      allOf:
+        - $ref: '#/components/schemas/DocumentLineInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid, readOnly: true }
+            line_number: { type: integer, readOnly: true }
+            line_total_agorot:
+              type: integer
+              format: int64
+              readOnly: true
+              description: |
+                unit_price x quantity, rounded to whole agorot half away from
+                zero. Computed by the server; a document's total is the exact
+                sum of these already-rounded lines.
+
+    DocumentDraftInput:
+      type: object
+      required: [document_type, customer_id, document_date, lines]
+      properties:
+        document_type: { $ref: '#/components/schemas/DocumentType' }
+        customer_id: { type: string, format: uuid }
+        activity_id: { type: [string, 'null'], format: uuid }
+        document_date:
+          type: string
+          format: date
+          description: Business date, already interpreted in Asia/Jerusalem
+        due_date: { type: [string, 'null'], format: date }
+        notes: { type: string }
+        lines:
+          type: array
+          minItems: 1
+          items: { $ref: '#/components/schemas/DocumentLineInput' }
+
+    Document:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        document_type: { $ref: '#/components/schemas/DocumentType' }
+        state: { $ref: '#/components/schemas/DocumentState' }
+        series:
+          type: string
+          description: '`A` for official documents, `TEST` while the compliance gate is closed'
+        number:
+          type: [integer, 'null']
+          format: int64
+          description: Null while the document is a draft
+        full_number:
+          type: string
+          description: The number as printed, e.g. `A-000123`. Empty for a draft.
+        customer_id: { type: string, format: uuid }
+        customer_name: { type: string }
+        activity_id: { type: [string, 'null'], format: uuid }
+        activity_name: { type: [string, 'null'] }
+        document_date: { type: string, format: date }
+        due_date: { type: [string, 'null'], format: date }
+        currency: { type: string, examples: [ILS] }
+        subtotal_agorot: { type: integer, format: int64 }
+        vat_agorot:
+          type: integer
+          format: int64
+          description: Always 0 in exempt-dealer mode
+        total_agorot: { type: integer, format: int64 }
+        notes: { type: string }
+        required_wording:
+          type: string
+          description: Wording the compliance adapter required, captured as issued
+        issued_at: { type: [string, 'null'], format: date-time }
+        cancelled_at: { type: [string, 'null'], format: date-time }
+        cancellation_reason: { type: [string, 'null'] }
+        pdf_sha256: { type: [string, 'null'] }
+        pdf_bytes: { type: [integer, 'null'], format: int64 }
+        template_version: { type: [string, 'null'] }
+        test_mode:
+          type: boolean
+          description: Issued while the compliance gate was closed; not a legal document
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        lines:
+          type: array
+          items: { $ref: '#/components/schemas/DocumentLine' }
+
+    DocumentPage:
+      type: object
+      properties:
+        documents:
+          type: array
+          items: { $ref: '#/components/schemas/Document' }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+
+    SequenceState:
+      type: object
+      properties:
+        document_type: { $ref: '#/components/schemas/DocumentType' }
+        series: { type: string }
+        next_number:
+          type: integer
+          format: int64
+          description: The number the next issuance will take
+        issued_count:
+          type: integer
+          format: int64
+          description: How many documents actually carry a number in this series
+        highest_issued: { type: [integer, 'null'], format: int64 }
+
+    DocumentSnapshot:
+      type: object
+      description: |
+        The exact values used at issuance. Rendering a historical document reads
+        only this.
+      properties:
+        schema_version: { type: integer }
+        business:
+          type: object
+          properties:
+            legal_name: { type: string }
+            display_name: { type: string }
+            business_number: { type: string }
+            address: { type: string }
+            phone: { type: string }
+            email: { type: string }
+            website: { type: string }
+            bank_details: { type: string }
+            footer_note: { type: string }
+        customer:
+          type: object
+          properties:
+            id: { type: string, format: uuid }
+            customer_type: { $ref: '#/components/schemas/CustomerType' }
+            display_name: { type: string }
+            legal_name: { type: string }
+            business_or_id_number: { type: string }
+            phone: { type: string }
+            email: { type: string }
+            address: { type: string }
+        activity:
+          type: [object, 'null']
+          properties:
+            id: { type: string, format: uuid }
+            name: { type: string }
+        document:
+          type: object
+          properties:
+            type: { $ref: '#/components/schemas/DocumentType' }
+            type_hebrew: { type: string }
+            series: { type: string }
+            number: { type: integer, format: int64 }
+            full_number: { type: string }
+            document_date: { type: string, format: date }
+            due_date: { type: string }
+            currency: { type: string }
+            notes: { type: string }
+            required_wording: { type: string }
+            test_mode: { type: boolean }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              line_number: { type: integer }
+              description: { type: string }
+              unit: { type: string }
+              quantity_milli: { type: integer, format: int64 }
+              unit_price_agorot: { type: integer, format: int64 }
+              line_total_agorot: { type: integer, format: int64 }
+        totals:
+          type: object
+          properties:
+            subtotal_agorot: { type: integer, format: int64 }
+            vat_agorot: { type: integer, format: int64 }
+            total_agorot: { type: integer, format: int64 }
+        issued_at: { type: string, format: date-time }
+        issued_by_email: { type: string }
+        template_version: { type: string }
+        business_mode:
+          type: string
+          description: Which tax regime produced this document
+
+    PaymentMethod:
+      type: string
+      enum: [CASH, BANK_TRANSFER, CREDIT_CARD, BIT, PAYBOX, CHECK, OTHER]
+
+    PaymentAllocationInput:
+      type: object
+      required: [document_id, amount_agorot]
+      properties:
+        document_id: { type: string, format: uuid }
+        amount_agorot: { type: integer, format: int64, minimum: 1 }
+
+    PaymentAllocation:
+      allOf:
+        - $ref: '#/components/schemas/PaymentAllocationInput'
+        - type: object
+          properties:
+            full_number: { type: string, readOnly: true }
+            document_type:
+              allOf: [{ $ref: '#/components/schemas/DocumentType' }]
+              readOnly: true
+
+    PaymentInput:
+      type: object
+      required: [customer_id, amount_agorot, received_at, method]
+      properties:
+        customer_id: { type: string, format: uuid }
+        amount_agorot:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Always positive. A refund is a different act with different paperwork
+            and is not modelled as a negative payment.
+        received_at:
+          type: string
+          format: date
+          description: Business date, already interpreted in Asia/Jerusalem
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+        reference:
+          type: string
+          description: Cheque number, transfer reference, last digits of a card
+        notes: { type: string }
+        activity_id: { type: [string, 'null'], format: uuid }
+        allocations:
+          type: array
+          description: |
+            What this payment settles. Omit it entirely for money on account.
+            The sum may not exceed the payment, and no single allocation may
+            exceed what its document still owes.
+          items: { $ref: '#/components/schemas/PaymentAllocationInput' }
+        issue_receipt:
+          type: boolean
+          default: true
+          description: |
+            Issue the receipt with the payment. Set false only when the renderer
+            is unavailable; issue the receipt afterwards.
+
+    Payment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        customer_id: { type: string, format: uuid }
+        customer_name: { type: string }
+        amount_agorot: { type: integer, format: int64 }
+        received_at: { type: string, format: date }
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+        method_hebrew: { type: string }
+        reference: { type: string }
+        notes: { type: string }
+        activity_id: { type: [string, 'null'], format: uuid }
+        activity_name: { type: [string, 'null'] }
+        receipt_document_id:
+          type: [string, 'null']
+          format: uuid
+          description: Null means no receipt has been issued yet
+        receipt_number: { type: [string, 'null'] }
+        allocated_agorot:
+          type: integer
+          format: int64
+          description: How much of this payment settles specific documents
+        on_account_agorot:
+          type: integer
+          format: int64
+          description: The remainder, which settles nothing in particular
+        allocations:
+          type: array
+          items: { $ref: '#/components/schemas/PaymentAllocation' }
+        created_at: { type: string, format: date-time }
+
+    PaymentPage:
+      type: object
+      properties:
+        payments:
+          type: array
+          items: { $ref: '#/components/schemas/Payment' }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+        total_amount_agorot:
+          type: integer
+          format: int64
+          description: Sum of every payment matching the filter, not only this page
+
+    MethodTotal:
+      type: object
+      properties:
+        method: { $ref: '#/components/schemas/PaymentMethod' }
+        method_hebrew: { type: string }
+        count: { type: integer }
+        total_agorot: { type: integer, format: int64 }
+
+    CustomerBalance:
+      type: object
+      properties:
+        customer_id: { type: string, format: uuid }
+        invoiced_agorot:
+          type: integer
+          format: int64
+          description: Total of issued, uncancelled invoices and payment requests
+        paid_agorot:
+          type: integer
+          format: int64
+          description: Every payment received from this customer
+        allocated_agorot:
+          type: integer
+          format: int64
+          description: How much of those payments settles specific documents
+        on_account_agorot:
+          type: integer
+          format: int64
+          description: Money received that settles nothing in particular
+        open_agorot:
+          type: integer
+          format: int64
+          description: |
+            invoiced minus allocated. Money on account is deliberately not netted
+            off: it has not been applied to anything, and the operator may still
+            choose where it goes.
+
+    OutstandingDocument:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        document_type: { $ref: '#/components/schemas/DocumentType' }
+        full_number: { type: string }
+        document_date: { type: string, format: date }
+        total_agorot: { type: integer, format: int64 }
+        allocated_agorot: { type: integer, format: int64 }
+        outstanding_agorot: { type: integer, format: int64 }
+
+    TimelineEntry:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [DOCUMENT, PAYMENT]
+        id: { type: string, format: uuid }
+        date: { type: string, format: date }
+        title:
+          type: string
+          description: The document type for a document, the payment method for a payment
+        full_number:
+          type: string
+          description: The document number, or the receipt number for a payment
+        amount_agorot: { type: integer, format: int64 }
+        state:
+          type: string
+          description: The document state, or RECEIPTED/UNRECEIPTED for a payment
+        detail: { type: string }
+
+    ExpenseAttachment:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        original_filename:
+          type: string
+          description: What the uploader called it. It never determines where the file is written.
+        content_type:
+          type: string
+          description: Determined by sniffing the bytes
+        byte_size: { type: integer, format: int64 }
+        sha256: { type: string }
+        uploaded_at: { type: string, format: date-time }
+
+    ExpenseInput:
+      type: object
+      required: [supplier, expense_date, amount_agorot]
+      properties:
+        supplier: { type: string, minLength: 1 }
+        expense_date: { type: string, format: date }
+        amount_agorot: { type: integer, format: int64, minimum: 1 }
+        category: { type: string }
+        payment_method:
+          allOf: [{ $ref: '#/components/schemas/PaymentMethod' }]
+          default: OTHER
+        reference: { type: string }
+        notes: { type: string }
+        activity_id: { type: [string, 'null'], format: uuid }
+
+    Expense:
+      allOf:
+        - $ref: '#/components/schemas/ExpenseInput'
+        - type: object
+          properties:
+            id: { type: string, format: uuid, readOnly: true }
+            payment_method_hebrew: { type: string, readOnly: true }
+            activity_name: { type: [string, 'null'], readOnly: true }
+            attachments:
+              type: array
+              readOnly: true
+              items: { $ref: '#/components/schemas/ExpenseAttachment' }
+            created_at: { type: string, format: date-time, readOnly: true }
+            updated_at: { type: string, format: date-time, readOnly: true }
+
+    ExpensePage:
+      type: object
+      properties:
+        expenses:
+          type: array
+          items: { $ref: '#/components/schemas/Expense' }
+        total: { type: integer }
+        limit: { type: integer }
+        offset: { type: integer }
+        total_amount_agorot: { type: integer, format: int64 }
+
+    CategoryTotal:
+      type: object
+      properties:
+        category: { type: string }
+        count: { type: integer }
+        total_agorot: { type: integer, format: int64 }
+
+    DeliveryAttempt:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        document_id: { type: string, format: uuid }
+        channel:
+          type: string
+          enum: [EMAIL, WHATSAPP_LINK]
+        recipient: { type: string }
+        state:
+          type: string
+          enum: [QUEUED, SENT, FAILED]
+        error: { type: [string, 'null'] }
+        attempted_at: { type: string, format: date-time }
+
+    WhatsAppShare:
+      type: object
+      properties:
+        phone: { type: string }
+        message:
+          type: string
+          description: A prepared Hebrew message naming the customer, document and amount
+        share_url:
+          type: string
+          description: A wa.me link with the number internationalized (050… becomes 972 50…)
+        download_url: { type: string }
+
+    RevenueRow:
+      type: object
+      properties:
+        key: { type: string }
+        label: { type: string }
+        count: { type: integer }
+        amount_agorot: { type: integer, format: int64 }
+
+    UnpaidRow:
+      type: object
+      properties:
+        document_id: { type: string, format: uuid }
+        full_number: { type: string }
+        document_type: { $ref: '#/components/schemas/DocumentType' }
+        customer_id: { type: string, format: uuid }
+        customer_name: { type: string }
+        document_date: { type: string, format: date }
+        due_date: { type: [string, 'null'], format: date }
+        total_agorot: { type: integer, format: int64 }
+        paid_agorot: { type: integer, format: int64 }
+        outstanding_agorot: { type: integer, format: int64 }
+        days_overdue:
+          type: integer
+          description: Positive once the due date has passed; zero otherwise
+
+    Turnover:
+      type: object
+      properties:
+        year: { type: integer }
+        revenue_agorot: { type: integer, format: int64 }
+        threshold_known:
+          type: boolean
+          description: False when no ceiling is configured for that year
+        threshold_agorot: { type: integer, format: int64 }
+        remaining_agorot: { type: integer, format: int64 }
+        percent_used: { type: number }
+
+    Dashboard:
+      type: object
+      properties:
+        business_date: { type: string, format: date }
+        revenue_today_agorot: { type: integer, format: int64 }
+        revenue_month_agorot: { type: integer, format: int64 }
+        revenue_year_agorot: { type: integer, format: int64 }
+        unpaid_count: { type: integer }
+        unpaid_amount_agorot: { type: integer, format: int64 }
+        overdue_count: { type: integer }
+        expenses_month_agorot: { type: integer, format: int64 }
+        failed_deliveries: { type: integer }
+        failed_jobs: { type: integer }
+        turnover: { $ref: '#/components/schemas/Turnover' }
+        recent_documents:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              full_number: { type: string }
+              document_type: { $ref: '#/components/schemas/DocumentType' }
+              customer_name: { type: string }
+              document_date: { type: string, format: date }
+              total_agorot: { type: integer, format: int64 }
+              state: { $ref: '#/components/schemas/DocumentState' }
+        recent_payments:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string, format: uuid }
+              customer_name: { type: string }
+              received_at: { type: string, format: date }
+              amount_agorot: { type: integer, format: int64 }
+              method: { $ref: '#/components/schemas/PaymentMethod' }
+
+    ExportStatus:
+      type: object
+      properties:
+        job_id: { type: string, format: uuid }
+        state:
+          type: string
+          enum: [PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED]
+        attempts: { type: integer }
+        created_at: { type: string, format: date-time }
+        filename: { type: string }
+        bytes: { type: integer, format: int64 }
+        sha256: { type: string }
+        error: { type: string }
+
+    BackupRun:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: [string, 'null'], format: date-time }
+        state:
+          type: string
+          enum: [RUNNING, SUCCEEDED, FAILED]
+        archive_path: { type: [string, 'null'] }
+        archive_bytes: { type: [integer, 'null'], format: int64 }
+        archive_sha256: { type: [string, 'null'] }
+        file_count: { type: [integer, 'null'] }
+        trigger:
+          type: string
+          enum: [SCHEDULED, MANUAL]
+        error: { type: [string, 'null'] }
+
+    BackupStatus:
+      type: object
+      properties:
+        configured:
+          type: boolean
+          description: False when BACKUP_DIR is unset; no backups run at all
+        directory: { type: string }
+        retention_days:
+          type: integer
+          description: |
+            How many archives stay in the folder. Disk hygiene, not records
+            retention — financial records are never pruned.
+        schedule_local: { type: string }
+        last_succeeded_at: { type: [string, 'null'], format: date-time }
+        last_archive_bytes: { type: [integer, 'null'], format: int64 }
+        hours_since_success: { type: [number, 'null'] }
+        stale:
+          type: boolean
+          description: The newest good backup is over 36 hours old, or there is none
+        last_run_state: { type: [string, 'null'] }
+        last_run_error: { type: [string, 'null'] }
+        tools:
+          type: object
+          properties:
+            pg_dump_major: { type: integer }
+            server_major: { type: integer }
+            version_mismatch: { type: boolean }
+            version_warning: { type: string }

@@ -1,0 +1,43 @@
+# Local development: PostgreSQL and the PDF renderer. The API and the web dev
+# server run on the host so they reload quickly.
+#
+#   make db-up
+name: tiny-wonders-invoice-dev
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: invoice-postgres-dev
+    environment:
+      POSTGRES_USER: invoice
+      POSTGRES_PASSWORD: invoice
+      POSTGRES_DB: invoice
+      # Business dates are interpreted in Go, but keeping the server in UTC
+      # removes any doubt about what a bare timestamp means.
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "${DEV_DB_PORT:-5433}:5432"
+    volumes:
+      - postgres-dev-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U invoice -d invoice"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Issuance needs a renderer; without one the API refuses to issue.
+  gotenberg:
+    image: gotenberg/gotenberg:8
+    container_name: invoice-gotenberg-dev
+    ports:
+      - "${DEV_PDF_PORT:-3000}:3000"
+    command:
+      - "gotenberg"
+      # Templates are self-contained HTML; no script has to run. The default
+      # deny list already confines file access to Gotenberg's own temp dir.
+      - "--chromium-disable-javascript=true"
+      - "--api-timeout=60s"
+
+volumes:
+  postgres-dev-data:

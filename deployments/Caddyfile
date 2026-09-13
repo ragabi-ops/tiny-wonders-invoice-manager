@@ -1,0 +1,63 @@
+# The only component exposed to the network, and the only web server in the
+# stack: it reverse-proxies the API and serves the SPA bundle baked into /srv
+# by proxy.Dockerfile.
+#
+# SITE_ADDRESS carries the scheme and hostname, e.g.
+# "https://tiny-wonders-invoice-manager.com". The hostname resolves through an
+# /etc/hosts entry, not DNS, so a public certificate authority could never issue
+# for it — hence `tls internal` below, which signs with Caddy's own CA. Trusting
+# that CA once is what makes the padlock real rather than clicked past; the root
+# lives at /data/caddy/pki/authorities/local/root.crt inside this container, and
+# docs/RUNBOOK.md has the command to install it.
+#
+# For a genuinely public deployment: drop `tls internal` and Caddy obtains and
+# renews a real certificate for SITE_ADDRESS automatically.
+
+{$SITE_ADDRESS} {
+	tls internal
+
+	encode gzip
+
+	# Applies to every response, API and SPA alike. The Go middleware sets these
+	# too; stating them here means a misconfigured origin cannot drop them.
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer
+		# Stated here rather than only in the Go middleware because the first
+		# request a browser makes is for the SPA, which Caddy serves itself. If
+		# only the API set this, the policy would not be installed until the
+		# first /api call — leaving exactly the one navigation that matters
+		# unprotected. Same value the middleware uses, so the two agree.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+	}
+
+	# The API. The SPA calls it same-origin, so no CORS entry is needed and
+	# cookies stay first-party. Its own Content-Security-Policy is stricter than
+	# the SPA's (default-src 'none') and is deliberately left alone here.
+	@api path /api/* /healthz /readyz
+	handle @api {
+		reverse_proxy api:8080
+	}
+
+	# Everything else is the Hebrew RTL SPA.
+	handle {
+		root * /srv
+
+		# The bundle is self-contained: no CDN, no inline script, no external
+		# fonts. connect-src is 'self' because the API is same-origin.
+		header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+
+		# Vite gives every asset a content hash, so those may be cached forever.
+		# index.html must never be, or a deploy leaves browsers on the old
+		# bundle while the API has already moved on.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@notassets not path /assets/*
+		header @notassets Cache-Control "no-cache"
+
+		try_files {path} /index.html
+		file_server
+	}
+}

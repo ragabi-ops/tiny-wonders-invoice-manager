@@ -1,0 +1,30 @@
+# Binaries
+/bin/
+/apps/api/api
+*.exe
+
+# Env / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Node
+node_modules/
+apps/web/dist/
+apps/web/.vite/
+apps/web/*.tsbuildinfo
+
+# Go
+*.test
+coverage.out
+
+# Local data
+/data/
+/storage/
+/backups/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
