@@ -28,11 +28,19 @@ import {
   IconEye,
   IconFileCheck,
   IconMail,
+  IconReceipt,
   IconTrash,
 } from '@tabler/icons-react';
 
 import { API_BASE, ApiError, api } from '@/api/client';
-import type { DeliveryAttempt, DeliveryStatus, InvoiceDocument, WhatsAppShare } from '@/api/types';
+import type {
+  DeliveryAttempt,
+  DeliveryStatus,
+  InvoiceDocument,
+  OutstandingDocument,
+  WhatsAppShare,
+} from '@/api/types';
+import { PaymentFormModal } from '@/components/PaymentFormModal';
 import { useSession } from '@/hooks/useSession';
 import { formatDate, formatDateTime, formatMoney } from '@/lib/format';
 import { DOCUMENT_STATE_COLORS, DOCUMENT_STATE_LABELS, DOCUMENT_TYPE_LABELS } from '@/lib/labels';
@@ -60,12 +68,32 @@ export function DocumentDetailPage() {
   const [cancelReason, setCancelReason] = useState('');
   const [cancelError, setCancelError] = useState<string | null>(null);
   const [share, setShare] = useState<WhatsAppShare | null>(null);
+  const [receiptOpen, setReceiptOpen] = useState(false);
 
   const documentQuery = useQuery({
     queryKey: ['document', id],
     queryFn: () => api.get<InvoiceDocument>(`/documents/${id}`),
     enabled: Boolean(id),
   });
+
+  // Only issued requests and invoices are owed money. A receipt settles them;
+  // it is not itself settleable.
+  const settleable =
+    documentQuery.data?.state === 'ISSUED' && documentQuery.data.document_type !== 'RECEIPT';
+
+  // The same query key the payment form uses, so recording a payment there
+  // refreshes the balance shown here.
+  const outstanding = useQuery({
+    queryKey: ['outstanding', documentQuery.data?.customer_id],
+    queryFn: () =>
+      api.get<{ documents: OutstandingDocument[] }>(
+        `/customers/${documentQuery.data?.customer_id}/outstanding`,
+      ),
+    enabled: settleable,
+  });
+  const outstandingAgorot = settleable
+    ? (outstanding.data?.documents.find((item) => item.id === id)?.outstanding_agorot ?? 0)
+    : 0;
 
   const deliveryStatus = useQuery({
     queryKey: ['delivery-status'],
@@ -200,6 +228,17 @@ export function DocumentDetailPage() {
               מסמך בדיקה
             </Badge>
           )}
+          {settleable && outstanding.isSuccess && (
+            <Badge variant="light" color={outstandingAgorot > 0 ? 'yellow' : 'teal'}>
+              {outstandingAgorot > 0 ? (
+                <>
+                  יתרה לתשלום <span className="numeric">{formatMoney(outstandingAgorot)}</span>
+                </>
+              ) : (
+                'שולם במלואו'
+              )}
+            </Badge>
+          )}
         </Group>
 
         <Group gap="sm">
@@ -245,6 +284,11 @@ export function DocumentDetailPage() {
             </>
           )}
 
+          {canEdit && outstandingAgorot > 0 && (
+            <Button leftSection={<IconReceipt size={18} />} onClick={() => setReceiptOpen(true)}>
+              הפקת קבלה
+            </Button>
+          )}
           {isIssued && (
             <Button
               component="a"
@@ -461,6 +505,13 @@ export function DocumentDetailPage() {
           </Table>
         </Card>
       )}
+
+      <PaymentFormModal
+        opened={receiptOpen}
+        onClose={() => setReceiptOpen(false)}
+        customerId={document.customer_id}
+        settleDocument={{ id: document.id, activityId: document.activity_id }}
+      />
 
       <Modal
         opened={cancelOpen}

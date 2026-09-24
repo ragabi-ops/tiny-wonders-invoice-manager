@@ -60,6 +60,21 @@ the next start creates a new CA, and the root you trusted no longer signs
 anything. Trust the new root with the same command. **Do not use `-v` on this
 stack**; it would take the database with it too.
 
+If the error is *expired* rather than untrusted, look at the served
+certificate's dates:
+
+```bash
+echo | openssl s_client -connect 127.0.0.1:9843 \
+  -servername tiny-wonders-invoice-manager.com 2>/dev/null | openssl x509 -noout -dates
+```
+
+A `notAfter` earlier than `notBefore` means the site certificate was signed
+against an expired intermediate. That happened on 2026-09-24, after the stack had
+been off for four days while the intermediate lived only 7 days. The Caddyfile now
+sets `intermediate_lifetime 1825d`, so it should not recur. If it does,
+`docker compose ... restart proxy` issues a fresh certificate; the root, and
+therefore the Keychain trust, is untouched.
+
 ---
 
 ## Moving to another machine

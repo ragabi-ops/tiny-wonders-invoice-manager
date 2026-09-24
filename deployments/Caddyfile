@@ -12,6 +12,21 @@
 #
 # For a genuinely public deployment: drop `tls internal` and Caddy obtains and
 # renews a real certificate for SITE_ADDRESS automatically.
+{
+	pki {
+		ca local {
+			# Caddy's default intermediate lives 7 days. If the stack is off for
+			# longer than that (Docker quit, laptop away), the first renewal on
+			# startup renews the intermediate but signs the site certificate
+			# clamped to the old intermediate's expiry — a certificate that expires
+			# before it starts, which every browser rejects. Caddy logs the renewal
+			# as a success and does not retry. Happened 2026-09-24 after four days
+			# down. Five years sits well inside the root's ten, and site
+			# certificates still renew every 12 hours as before.
+			intermediate_lifetime 1825d
+		}
+	}
+}
 
 {$SITE_ADDRESS} {
 	tls internal
