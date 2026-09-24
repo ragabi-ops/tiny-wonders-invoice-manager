@@ -42,6 +42,13 @@ interface Props {
   onClose: () => void;
   /** Pre-selects a customer, when opened from their page. */
   customerId?: string;
+  /**
+   * Settles one issued document, when opened from its page: the amount and the
+   * allocation start at what it still owes, and the activity is carried over.
+   * How the money arrived is not something the document knows, so method,
+   * date and reference are still the operator's to fill in.
+   */
+  settleDocument?: { id: string; activityId: string | null };
 }
 
 /**
@@ -49,7 +56,7 @@ interface Props {
  * server transaction (plan.md 12); the checkbox exists for the case where the
  * PDF renderer is down and the money still has to be recorded.
  */
-export function PaymentFormModal({ opened, onClose, customerId }: Props) {
+export function PaymentFormModal({ opened, onClose, customerId, settleDocument }: Props) {
   const queryClient = useQueryClient();
 
   const [customer, setCustomer] = useState<string | null>(customerId ?? null);
@@ -63,6 +70,7 @@ export function PaymentFormModal({ opened, onClose, customerId }: Props) {
   const [issueReceipt, setIssueReceipt] = useState(true);
   const [allocations, setAllocations] = useState<Record<string, number>>({});
   const [formError, setFormError] = useState<string | null>(null);
+  const [prefilled, setPrefilled] = useState(false);
 
   const debouncedCustomerSearch = useDebounced(customerSearch, 250);
 
@@ -74,11 +82,12 @@ export function PaymentFormModal({ opened, onClose, customerId }: Props) {
     setMethod('BANK_TRANSFER');
     setReference('');
     setNotes('');
-    setActivityId(null);
+    setActivityId(settleDocument?.activityId ?? null);
     setIssueReceipt(true);
     setAllocations({});
     setFormError(null);
-  }, [opened, customerId]);
+    setPrefilled(false);
+  }, [opened, customerId, settleDocument?.id, settleDocument?.activityId]);
 
   const customers = useQuery({
     queryKey: ['customers', 'picker', debouncedCustomerSearch],
@@ -98,6 +107,19 @@ export function PaymentFormModal({ opened, onClose, customerId }: Props) {
     queryFn: () => api.get<{ documents: OutstandingDocument[] }>(`/customers/${customer}/outstanding`),
     enabled: opened && Boolean(customer),
   });
+
+  const settledDocument = settleDocument
+    ? outstanding.data?.documents.find((item) => item.id === settleDocument.id)
+    : undefined;
+
+  // The outstanding balance arrives after the modal opens, so the prefill waits
+  // for it, and runs once so it never overwrites what the operator has typed.
+  useEffect(() => {
+    if (!opened || prefilled || !settledDocument) return;
+    setAmountShekels(agorotToShekels(settledDocument.outstanding_agorot));
+    setAllocations({ [settledDocument.id]: settledDocument.outstanding_agorot });
+    setPrefilled(true);
+  }, [opened, prefilled, settledDocument]);
 
   const amountAgorot = shekelsToAgorot(amountShekels);
   const allocatedAgorot = useMemo(
@@ -208,7 +230,7 @@ export function PaymentFormModal({ opened, onClose, customerId }: Props) {
   });
 
   return (
-    <Modal opened={opened} onClose={onClose} title="רישום תשלום" size="xl" centered>
+    <Modal opened={opened} onClose={onClose} title={settleDocument ? 'הפקת קבלה' : 'רישום תשלום'} size="xl" centered>
       <Stack gap="md">
         {formError && (
           <Alert color="red" variant="light" role="alert" withCloseButton onClose={() => setFormError(null)}>
@@ -248,7 +270,19 @@ export function PaymentFormModal({ opened, onClose, customerId }: Props) {
               fixedDecimalScale
               suffix=" ₪"
               value={amountShekels}
-              onChange={(value) => setAmountShekels(typeof value === 'number' ? value : Number(value) || 0)}
+              onChange={(value) => {
+                const shekels = typeof value === 'number' ? value : Number(value) || 0;
+                setAmountShekels(shekels);
+                // A partial payment against the document it was opened from
+                // settles that much of it, rather than leaving an allocation
+                // larger than the payment and a save that refuses to enable.
+                if (settledDocument) {
+                  setAllocation(
+                    settledDocument.id,
+                    Math.min(shekelsToAgorot(shekels), settledDocument.outstanding_agorot),
+                  );
+                }
+              }}
             />
           </Grid.Col>
           <Grid.Col span={{ base: 12, sm: 3 }}>
